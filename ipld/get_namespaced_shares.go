@@ -77,11 +77,11 @@ type fetchedBounds struct {
 	highest int64
 }
 
-// update checks if the passed index is outside the current bounds,
+// update checks if the passed pos is outside the current bounds,
 // and updates the bounds atomically if it extends them.
 func (b *fetchedBounds) update(index int64) {
 	lowest := atomic.LoadInt64(&b.lowest)
-	// try to write index to the lower bound if appropriate, and retry until the atomic op is successful
+	// try to write pos to the lower bound if appropriate, and retry until the atomic op is successful
 	// CAS ensures that we don't overwrite if the bound has been updated in another goroutine after the comparison here
 	for index < lowest && !atomic.CompareAndSwapInt64(&b.lowest, lowest, index) {
 		lowest = atomic.LoadInt64(&b.lowest)
@@ -193,7 +193,7 @@ func getLeavesByNamespace(
 				for i, lnk := range links {
 					newJob := &job{
 						id: lnk.Cid,
-						// position represents the index in a flattened binary tree,
+						// position represents the pos in a flattened binary tree,
 						// so we can return a slice of leaves in order
 						pos: j.pos*2 + i,
 						// we pass the context to job so that spans are tracked in a tree
