@@ -13,25 +13,43 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+type testParams struct {
+	networkHead  uint64
+	sampleFrom   uint64
+	timeoutDelay time.Duration
+	dasParams    dasingParams
+}
+
+func defaultDasParams() dasingParams {
+	params := dasingParams{
+		samplingRange:     10,
+		concurrencyLimit:  10,
+		bgStoreInterval:   10 * time.Minute,
+		priorityQueueSize: 16 * 4,
+		genesisHeight:     1,
+	}
+
+	return params
+}
+
+func defaultTestParams() testParams {
+	dasParamsDefault := defaultDasParams()
+	return testParams{
+		networkHead:  uint64(500),
+		sampleFrom:   uint64(dasParamsDefault.genesisHeight),
+		timeoutDelay: 125 * time.Second,
+		dasParams:    dasParamsDefault,
+	}
+}
+
 func TestCoordinator(t *testing.T) {
-
-	params := dasingParams{}
-	params.samplingRange = 10
-	params.concurrencyLimit = 10
-	params.bgStoreInterval = 10 * time.Minute
-	params.priorityQueueSize = 16 * 4
-	params.genesisHeight = 1
-
-	networkHead := uint64(500)
-	sampleFrom := uint64(params.genesisHeight)
-	timeoutDelay := 125 * time.Second
-
 	t.Run("test run", func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(context.Background(), timeoutDelay)
+		testParams := defaultTestParams()
 
-		sampler := newMockSampler(sampleFrom, networkHead)
+		ctx, cancel := context.WithTimeout(context.Background(), testParams.timeoutDelay)
+		sampler := newMockSampler(testParams.sampleFrom, testParams.networkHead)
+		coordinator := newSamplingCoordinator(testParams.dasParams, getterStub{}, onceMiddleWare(sampler.sample))
 
-		coordinator := newSamplingCoordinator(params, getterStub{}, onceMiddleWare(sampler.sample))
 		go coordinator.run(ctx, sampler.checkpoint)
 
 		// check if all jobs were sampled successfully
@@ -42,25 +60,27 @@ func TestCoordinator(t *testing.T) {
 		assert.Emptyf(t, coordinator.state.failed, "failed list should be empty")
 
 		cancel()
-		stopCtx, cancel := context.WithTimeout(context.Background(), timeoutDelay)
+		stopCtx, cancel := context.WithTimeout(context.Background(), testParams.timeoutDelay)
 		defer cancel()
 		assert.NoError(t, coordinator.wait(stopCtx))
 		assert.Equal(t, sampler.finalState(), newCheckpoint(coordinator.state.unsafeStats()))
 	})
 
 	t.Run("discovered new headers", func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(context.Background(), timeoutDelay)
+		testParams := defaultTestParams()
 
-		sampler := newMockSampler(sampleFrom, networkHead)
+		ctx, cancel := context.WithTimeout(context.Background(), testParams.timeoutDelay)
 
-		coordinator := newSamplingCoordinator(params, getterStub{}, sampler.sample)
+		sampler := newMockSampler(testParams.sampleFrom, testParams.networkHead)
+
+		coordinator := newSamplingCoordinator(testParams.dasParams, getterStub{}, sampler.sample)
 		go coordinator.run(ctx, sampler.checkpoint)
 
 		time.Sleep(50 * time.Millisecond)
 		// discover new height
 		for i := 0; i < 200; i++ {
 			// mess the order by running in go-routine
-			sampler.discover(ctx, networkHead+uint64(i), coordinator.listen)
+			sampler.discover(ctx, testParams.networkHead+uint64(i), coordinator.listen)
 		}
 
 		// check if all jobs were sampled successfully
@@ -71,7 +91,7 @@ func TestCoordinator(t *testing.T) {
 		assert.Emptyf(t, coordinator.state.failed, "failed list should be empty")
 
 		cancel()
-		stopCtx, cancel := context.WithTimeout(context.Background(), timeoutDelay)
+		stopCtx, cancel := context.WithTimeout(context.Background(), testParams.timeoutDelay)
 		defer cancel()
 		assert.NoError(t, coordinator.wait(stopCtx))
 		assert.Equal(t, sampler.finalState(), newCheckpoint(coordinator.state.unsafeStats()))
@@ -79,28 +99,29 @@ func TestCoordinator(t *testing.T) {
 
 	t.Run("prioritize newly discovered over known", func(t *testing.T) {
 
-		// params := dasingParams{}
-		params.concurrencyLimit = 1
-		params.samplingRange = 4
+		testParams := defaultTestParams()
 
-		sampleFrom := uint64(1)
-		networkHead := uint64(10)
+		testParams.dasParams.concurrencyLimit = 1
+		testParams.dasParams.samplingRange = 4
+
+		testParams.sampleFrom = 1
+		testParams.networkHead = 10
 		toBeDiscovered := uint64(20)
 
-		sampler := newMockSampler(sampleFrom, networkHead)
+		sampler := newMockSampler(testParams.sampleFrom, testParams.networkHead)
 
-		ctx, cancel := context.WithTimeout(context.Background(), timeoutDelay)
+		ctx, cancel := context.WithTimeout(context.Background(), testParams.timeoutDelay)
 
 		// lock worker before start, to not let it indicateDone before discover
-		lk := newLock(sampleFrom, sampleFrom)
+		lk := newLock(testParams.sampleFrom, testParams.sampleFrom)
 
 		// expect worker to prioritize newly discovered  (20 -> 10) and then old (0 -> 10)
-		order := newCheckOrder().addInterval(sampleFrom, uint64(params.samplingRange)) // worker will pick up first job before discovery
-		order.addStacks(networkHead+1, toBeDiscovered, uint64(params.samplingRange))
-		order.addInterval(uint64(params.samplingRange+1), toBeDiscovered)
+		order := newCheckOrder().addInterval(testParams.sampleFrom, uint64(testParams.dasParams.samplingRange)) // worker will pick up first job before discovery
+		order.addStacks(testParams.networkHead+1, toBeDiscovered, uint64(testParams.dasParams.samplingRange))
+		order.addInterval(uint64(testParams.dasParams.samplingRange+1), toBeDiscovered)
 
 		// start coordinator
-		coordinator := newSamplingCoordinator(params, getterStub{},
+		coordinator := newSamplingCoordinator(testParams.dasParams, getterStub{},
 			lk.middleWare(
 				order.middleWare(sampler.sample),
 			),
@@ -117,7 +138,7 @@ func TestCoordinator(t *testing.T) {
 		assert.Equal(t, 0, sampler.sampledAmount())
 
 		// unblock worker
-		lk.release(sampleFrom)
+		lk.release(testParams.sampleFrom)
 
 		// check if all jobs were sampled successfully
 		assert.NoError(t, sampler.finished(ctx), "not all headers were sampled")
@@ -127,27 +148,28 @@ func TestCoordinator(t *testing.T) {
 		assert.Emptyf(t, coordinator.state.failed, "failed list should be empty")
 
 		cancel()
-		stopCtx, cancel := context.WithTimeout(context.Background(), timeoutDelay)
+		stopCtx, cancel := context.WithTimeout(context.Background(), testParams.timeoutDelay)
 		defer cancel()
 		assert.NoError(t, coordinator.wait(stopCtx))
 		assert.Equal(t, sampler.finalState(), newCheckpoint(coordinator.state.unsafeStats()))
 	})
 
 	t.Run("priority routine should not lock other workers", func(t *testing.T) {
-		params.samplingRange = 20
-		networkHead := uint64(20)
-		ctx, cancel := context.WithTimeout(context.Background(), timeoutDelay)
+		testParams := defaultTestParams()
 
-		sampler := newMockSampler(sampleFrom, networkHead)
+		testParams.networkHead = uint64(20)
+		ctx, cancel := context.WithTimeout(context.Background(), testParams.timeoutDelay)
 
-		lk := newLock(sampleFrom, networkHead) // lock all workers before start
-		coordinator := newSamplingCoordinator(params, getterStub{},
+		sampler := newMockSampler(testParams.sampleFrom, testParams.networkHead)
+
+		lk := newLock(testParams.sampleFrom, testParams.networkHead) // lock all workers before start
+		coordinator := newSamplingCoordinator(testParams.dasParams, getterStub{},
 			lk.middleWare(sampler.sample))
 		go coordinator.run(ctx, sampler.checkpoint)
 
 		time.Sleep(50 * time.Millisecond)
 		// discover new height and lock it
-		discovered := networkHead + 1
+		discovered := testParams.networkHead + 1
 		lk.add(discovered)
 		sampler.discover(ctx, discovered, coordinator.listen)
 
@@ -161,7 +183,7 @@ func TestCoordinator(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 
 		// check that only last header is pending
-		assert.EqualValues(t, int(discovered-sampleFrom), sampler.doneAmount())
+		assert.EqualValues(t, int(discovered-testParams.sampleFrom), sampler.doneAmount())
 		assert.False(t, sampler.heightIsDone(discovered))
 
 		// release all headers for coordinator
@@ -175,27 +197,28 @@ func TestCoordinator(t *testing.T) {
 		assert.Emptyf(t, coordinator.state.failed, "failed list is not empty")
 
 		cancel()
-		stopCtx, cancel := context.WithTimeout(context.Background(), timeoutDelay)
+		stopCtx, cancel := context.WithTimeout(context.Background(), testParams.timeoutDelay)
 		defer cancel()
 		assert.NoError(t, coordinator.wait(stopCtx))
 		assert.Equal(t, sampler.finalState(), newCheckpoint(coordinator.state.unsafeStats()))
 	})
 
 	t.Run("failed should be stored", func(t *testing.T) {
-		sampleFrom := uint64(1)
-		ctx, cancel := context.WithTimeout(context.Background(), timeoutDelay)
+		testParams := defaultTestParams()
+		testParams.sampleFrom = 1
+		ctx, cancel := context.WithTimeout(context.Background(), testParams.timeoutDelay)
 
 		bornToFail := []uint64{4, 8, 15, 16, 23, 42}
-		sampler := newMockSampler(sampleFrom, networkHead, bornToFail...)
+		sampler := newMockSampler(testParams.sampleFrom, testParams.networkHead, bornToFail...)
 
-		coordinator := newSamplingCoordinator(params, getterStub{}, onceMiddleWare(sampler.sample))
+		coordinator := newSamplingCoordinator(testParams.dasParams, getterStub{}, onceMiddleWare(sampler.sample))
 		go coordinator.run(ctx, sampler.checkpoint)
 
 		// wait for coordinator to indicateDone catchup
 		assert.NoError(t, coordinator.state.waitCatchUp(ctx))
 
 		cancel()
-		stopCtx, cancel := context.WithTimeout(context.Background(), timeoutDelay)
+		stopCtx, cancel := context.WithTimeout(context.Background(), testParams.timeoutDelay)
 		defer cancel()
 		assert.NoError(t, coordinator.wait(stopCtx))
 
@@ -208,16 +231,18 @@ func TestCoordinator(t *testing.T) {
 	})
 
 	t.Run("failed should retry on restart", func(t *testing.T) {
-		sampleFrom := uint64(50)
-		ctx, cancel := context.WithTimeout(context.Background(), timeoutDelay)
+		testParams := defaultTestParams()
 
-		failedLastRun := map[uint64]int{4: 1, 8: 2, 15: 1, 16: 1, 23: 1, 42: 1, sampleFrom - 1: 1}
+		testParams.sampleFrom = uint64(50)
+		ctx, cancel := context.WithTimeout(context.Background(), testParams.timeoutDelay)
+
+		failedLastRun := map[uint64]int{4: 1, 8: 2, 15: 1, 16: 1, 23: 1, 42: 1, testParams.sampleFrom - 1: 1}
 		failedAgain := []uint64{16}
 
-		sampler := newMockSampler(sampleFrom, networkHead, failedAgain...)
+		sampler := newMockSampler(testParams.sampleFrom, testParams.networkHead, failedAgain...)
 		sampler.checkpoint.Failed = failedLastRun
 
-		coordinator := newSamplingCoordinator(params, getterStub{}, onceMiddleWare(sampler.sample))
+		coordinator := newSamplingCoordinator(testParams.dasParams, getterStub{}, onceMiddleWare(sampler.sample))
 		go coordinator.run(ctx, sampler.checkpoint)
 
 		// check if all jobs were sampled successfully
@@ -227,7 +252,7 @@ func TestCoordinator(t *testing.T) {
 		assert.NoError(t, coordinator.state.waitCatchUp(ctx))
 
 		cancel()
-		stopCtx, cancel := context.WithTimeout(context.Background(), timeoutDelay)
+		stopCtx, cancel := context.WithTimeout(context.Background(), testParams.timeoutDelay)
 		defer cancel()
 		assert.NoError(t, coordinator.wait(stopCtx))
 
